@@ -1,10 +1,3 @@
-"""
-Clean Forward Bot
-Copies videos/documents from source channels to target without forward tags.
-Auto-restart on crash via internal watchdog loop.
-Multi-user support with MongoDB backend.
-"""
-
 import asyncio
 import logging
 import os
@@ -17,7 +10,7 @@ from datetime import datetime
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelInvalid, PeerIdInvalid, UserNotParticipant
+from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelInvalid, PeerIdInvalid
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -42,6 +35,10 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
+
+# ─── PERMISSION CACHE ─────────────────────────────────────────────────────────
+
+perm_cache: Dict[int, bool] = {}  # {chat_id: is_admin}
 
 # ─── MONGODB CONNECTION ────────────────────────────────────────────────────────
 
@@ -159,31 +156,6 @@ class MongoDBManager:
 # Global MongoDB manager
 db_manager = MongoDBManager(MONGODB_URI, DATABASE_NAME)
 
-# ─── PERMISSION CACHE ─────────────────────────────────────────────────────────
-
-class PermissionCache:
-    """Cache bot admin status in channels to avoid repeated checks."""
-    
-    def __init__(self):
-        self.admin_in: Dict[int, bool] = {}  # {chat_id: is_admin}
-    
-    def is_admin(self, chat_id: int) -> Optional[bool]:
-        """Get cached admin status, or None if not cached."""
-        return self.admin_in.get(chat_id)
-    
-    def set_admin(self, chat_id: int, is_admin: bool):
-        """Cache admin status for a chat."""
-        self.admin_in[chat_id] = is_admin
-        status = "✅ admin" if is_admin else "❌ not admin"
-        log.info(f"Permission cache: {chat_id} → {status}")
-    
-    def clear(self):
-        """Clear all cached permissions (on restart)."""
-        self.admin_in.clear()
-        log.info("Permission cache cleared")
-
-perm_cache = PermissionCache()
-
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def parse_channel_id(text: str) -> Optional[int]:
@@ -198,38 +170,23 @@ def parse_channel_id(text: str) -> Optional[int]:
     return None
 
 async def verify_admin_in_chat(client: Client, chat_id: int) -> bool:
-    """
-    Verify bot is actually an admin in the given chat.
-    Returns True if admin, False otherwise.
-    Caches the result.
-    """
-    # Check cache first
-    cached = perm_cache.is_admin(chat_id)
-    if cached is not None:
-        return cached
+    """Check if bot is admin in the chat."""
+    if chat_id in perm_cache:
+        return perm_cache[chat_id]
     
     try:
-        me = await client.get_me()
-        member = await client.get_chat_member(chat_id, me.id)
-        is_admin = member.is_admin or member.is_owner
-        perm_cache.set_admin(chat_id, is_admin)
+        me = await client.get_chat_member(chat_id, "me")
+        # Check status attribute (not is_admin)
+        is_admin = me.status in ["creator", "administrator"]
+        perm_cache[chat_id] = is_admin
         return is_admin
-    except UserNotParticipant:
-        log.warning(f"Bot is not a member of {chat_id}")
-        perm_cache.set_admin(chat_id, False)
-        return False
-    except (ChatAdminRequired, ChannelInvalid, PeerIdInvalid) as e:
-        log.error(f"Cannot verify admin status in {chat_id}: {e}")
-        perm_cache.set_admin(chat_id, False)
-        return False
     except Exception as e:
         log.error(f"Unexpected error verifying admin in {chat_id}: {e}")
         return False
 
 async def safe_copy(client: Client, from_chat: int, msg_id: int, to_chat: int) -> bool:
     """Copy a single message without forward tag, with retry on flood wait."""
-    
-    # Verify admin status before attempting copy
+    # Verify bot is admin in target before attempting
     if not await verify_admin_in_chat(client, to_chat):
         log.error(f"Bot is not an admin in target chat {to_chat}")
         return False
@@ -247,7 +204,6 @@ async def safe_copy(client: Client, from_chat: int, msg_id: int, to_chat: int) -
             await asyncio.sleep(e.value + 1)
         except (ChatAdminRequired, ChannelInvalid, PeerIdInvalid) as e:
             log.error(f"Permission/channel error: {e}")
-            perm_cache.set_admin(to_chat, False)
             return False
         except Exception as e:
             log.error(f"Attempt {attempt + 1} failed: {e}")
@@ -332,12 +288,10 @@ def register_handlers(app: Client):
         if cid is None:
             return await msg.reply("❌ Invalid channel ID. Must start with `-100`.")
         
-        # Verify bot is admin in target before setting
-        is_admin = await verify_admin_in_chat(client, cid)
-        if not is_admin:
+        # Verify bot is admin in target channel before setting
+        if not await verify_admin_in_chat(client, cid):
             return await msg.reply(
-                f"❌ Bot is not an admin in `{cid}`.\n\n"
-                "**Fix:** Add the bot as an admin to the target channel, then try again."
+                f"❌ Cannot access that channel. Make sure the bot is an **admin** there, then try again."
             )
         
         await db_manager.set_target(user_id, cid)
@@ -470,8 +424,9 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 
 async def run_once() -> None:
     """Start the bot and run until it crashes or stops."""
-    # Clear permission cache on each restart
+    global perm_cache
     perm_cache.clear()
+    log.info("Permission cache cleared")
     
     await db_manager.connect()
     app = build_app()
