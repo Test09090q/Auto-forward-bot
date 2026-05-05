@@ -159,37 +159,78 @@ db_manager = MongoDBManager(MONGODB_URI, DATABASE_NAME)
 
 # ─── PEER RESOLUTION ──────────────────────────────────────────────────────────
 
+from pyrogram.raw import functions as raw_functions
+from pyrogram.raw import types as raw_types
+
 async def resolve_peer_safe(client: Client, chat_id: int) -> bool:
     """
-    Ensure the peer is known to the current Pyrogram session.
-    Pyrogram caches the result so subsequent calls are instant.
-    Returns True on success, False on any unrecoverable error.
+    Force Pyrogram to cache a channel peer so copy_message never gets
+    PeerIdInvalid — even after a fresh restart where the session file
+    has no stored peers.
+
+    Strategy (in order):
+      1. client.get_messages() — fetches 1 message, forces peer resolution
+         for channels the bot is already a member/admin of.
+      2. Direct raw API call InputChannel — last-resort populate of cache.
+
+    Returns True when the peer is now cached, False when genuinely inaccessible.
     """
+    # ── Method 1: get_messages (works for channels bot is member/admin of) ──
     try:
-        await client.get_chat(chat_id)
+        await client.get_messages(chat_id, 1)
+        log.debug(f"Peer {chat_id} resolved via get_messages.")
         return True
     except FloodWait as e:
-        log.warning(f"FloodWait while resolving peer {chat_id}: {e.value}s — waiting…")
+        log.warning(f"FloodWait {e.value}s resolving {chat_id} — waiting…")
         await asyncio.sleep(e.value + 1)
-        try:
-            await client.get_chat(chat_id)
-            return True
-        except Exception as e2:
-            log.error(f"Still cannot resolve peer {chat_id} after FloodWait: {e2}")
-            return False
-    except (ChannelInvalid, PeerIdInvalid) as e:
-        log.error(f"Cannot resolve peer {chat_id}: {e}")
+    except (ChannelInvalid, PeerIdInvalid):
+        pass   # fall through to method 2
+    except Exception:
+        pass   # fall through to method 2
+
+    # ── Method 2: raw ResolveUsername / InputPeerChannel via invoke ─────────
+    # Strip -100 prefix to get the bare channel id
+    try:
+        bare_id = int(str(chat_id).replace("-100", ""))
+        # Build InputPeerChannel with access_hash=0 — Telegram will reject
+        # it but Pyrogram will first try to resolve from its peer cache;
+        # we use GetFullChannel so Telegram tells us the real access hash.
+        from pyrogram.raw.functions.channels import GetFullChannel
+        from pyrogram.raw.types import InputChannel
+        await client.invoke(GetFullChannel(channel=InputChannel(
+            channel_id=bare_id,
+            access_hash=0
+        )))
+        log.debug(f"Peer {chat_id} resolved via raw GetFullChannel.")
+        return True
+    except PeerIdInvalid:
+        # access_hash=0 rejected — try fetching dialogs to populate cache
+        pass
+    except Exception:
+        pass
+
+    # ── Method 3: walk dialogs until we find the channel ────────────────────
+    try:
+        async for dialog in client.get_dialogs():
+            if dialog.chat and dialog.chat.id == chat_id:
+                log.debug(f"Peer {chat_id} resolved via get_dialogs walk.")
+                return True
+        log.error(f"Peer {chat_id} not found in dialogs — bot may not be a member.")
+        return False
+    except FloodWait as e:
+        log.warning(f"FloodWait {e.value}s during dialog walk for {chat_id}")
+        await asyncio.sleep(e.value + 1)
         return False
     except Exception as e:
-        log.error(f"Unexpected error resolving peer {chat_id}: {e}")
+        log.error(f"All resolution methods failed for peer {chat_id}: {e}")
         return False
 
 
 async def prewarm_peers(client: Client):
     """
-    Called once after bot.start().
+    Called once right after app.start().
     Resolves every channel stored in MongoDB so Pyrogram caches them —
-    prevents PeerIdInvalid on the first message after a restart.
+    prevents PeerIdInvalid on the first forwarded message after a restart.
     """
     log.info("🔥 Pre-warming peer cache…")
     peers = await db_manager.get_all_unique_peers()
@@ -200,8 +241,7 @@ async def prewarm_peers(client: Client):
     ok_count = 0
     for cid in peers:
         ok = await resolve_peer_safe(client, cid)
-        status = "✅" if ok else "❌"
-        log.info(f"   Peer {cid}: {status}")
+        log.info(f"   Peer {cid}: {'✅' if ok else '❌'}")
         if ok:
             ok_count += 1
 
@@ -277,7 +317,7 @@ def register_handlers(app: Client):
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(client: Client, msg: Message):
         await msg.reply(
-            "👋 **Welcome to the Clean Forward Bot**\n\n"
+            "👋 **Welome to the Clean Forward Bot**\n\n"
             "This bot copies videos and documents from source channels to your "
             "target channel — without any forwarding headers.\n\n"
             "**Commands:**\n"
