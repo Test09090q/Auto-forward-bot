@@ -3,8 +3,6 @@ Clean Forward Bot
 Copies videos/documents from source channels to target without forward tags.
 Auto-restart on crash via internal watchdog loop.
 Multi-user support with MongoDB backend.
-
-Fix: PeerIdInvalid after restart — peers are now resolved/pre-warmed on startup.
 """
 
 import asyncio
@@ -19,19 +17,19 @@ from datetime import datetime
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelInvalid, PeerIdInvalid
+from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelInvalid, PeerIdInvalid, UserNotParticipant
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-API_ID      = int(os.environ.get("API_ID", "0"))
-API_HASH    = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", ""))
+API_HASH = os.environ.get("API_HASH", "")
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 DATABASE_NAME = os.environ.get("DATABASE_NAME", "clean_forward_bot")
 
-MAX_RETRIES   = 0   # 0 = restart forever
-RESTART_DELAY = 5   # seconds between restart attempts
+MAX_RETRIES = 0  # 0 = restart forever
+RESTART_DELAY = 5  # seconds between restart attempts
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -45,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── MONGODB ──────────────────────────────────────────────────────────────────
+# ─── MONGODB CONNECTION ────────────────────────────────────────────────────────
 
 class MongoDBManager:
     """Manages MongoDB connections and data operations for multi-user support."""
@@ -59,28 +57,36 @@ class MongoDBManager:
         self.stats_collection: Optional[AsyncIOMotorCollection] = None
 
     async def connect(self):
+        """Connect to MongoDB."""
         try:
             self.client = AsyncIOMotorClient(self.uri)
             self.db = self.client[self.database_name]
             self.users_collection = self.db["users"]
             self.stats_collection = self.db["stats"]
+            
+            # Create indexes
             await self.users_collection.create_index("user_id", unique=True)
             await self.stats_collection.create_index("user_id", unique=True)
-            await self.client.admin.command("ping")
+            
+            # Test connection
+            await self.client.admin.command('ping')
             log.info("✅ Connected to MongoDB")
         except Exception as e:
             log.error(f"❌ MongoDB connection failed: {e}")
             raise
 
     async def disconnect(self):
+        """Disconnect from MongoDB."""
         if self.client:
             self.client.close()
             log.info("MongoDB disconnected")
 
     async def get_user_config(self, user_id: int) -> Dict[str, Any]:
+        """Get user configuration."""
         doc = await self.users_collection.find_one({"user_id": user_id})
         if doc:
             return doc
+        # Create default config
         default_config = {
             "user_id": user_id,
             "sources": [],
@@ -92,6 +98,7 @@ class MongoDBManager:
         return default_config
 
     async def update_user_config(self, user_id: int, update_data: Dict[str, Any]):
+        """Update user configuration."""
         update_data["updated_at"] = datetime.utcnow()
         await self.users_collection.update_one(
             {"user_id": user_id},
@@ -99,6 +106,7 @@ class MongoDBManager:
         )
 
     async def add_source(self, user_id: int, channel_id: int) -> bool:
+        """Add a source channel to user's list."""
         config = await self.get_user_config(user_id)
         if channel_id in config["sources"]:
             return False
@@ -107,6 +115,7 @@ class MongoDBManager:
         return True
 
     async def remove_source(self, user_id: int, channel_id: int) -> bool:
+        """Remove a source channel from user's list."""
         config = await self.get_user_config(user_id)
         if channel_id not in config["sources"]:
             return False
@@ -115,20 +124,25 @@ class MongoDBManager:
         return True
 
     async def set_target(self, user_id: int, channel_id: int):
+        """Set target channel for user."""
         await self.update_user_config(user_id, {"target": channel_id})
 
     async def clear_target(self, user_id: int):
+        """Clear target channel for user."""
         await self.update_user_config(user_id, {"target": None})
 
     async def get_sources(self, user_id: int) -> List[int]:
+        """Get user's source channels."""
         config = await self.get_user_config(user_id)
         return config.get("sources", [])
 
     async def get_target(self, user_id: int) -> Optional[int]:
+        """Get user's target channel."""
         config = await self.get_user_config(user_id)
         return config.get("target")
 
     async def record_copy(self, user_id: int, from_chat: int, msg_id: int, to_chat: int, success: bool):
+        """Record a copy operation for statistics."""
         await self.stats_collection.update_one(
             {"user_id": user_id},
             {
@@ -142,110 +156,33 @@ class MongoDBManager:
             upsert=True
         )
 
-    async def get_all_unique_peers(self) -> List[int]:
-        """Return every unique source + target channel ID stored in DB."""
-        all_users = await self.users_collection.find({}).to_list(None)
-        seen: set = set()
-        for user in all_users:
-            for cid in user.get("sources", []):
-                seen.add(cid)
-            if t := user.get("target"):
-                seen.add(t)
-        return list(seen)
-
-
 # Global MongoDB manager
 db_manager = MongoDBManager(MONGODB_URI, DATABASE_NAME)
 
-# ─── PEER RESOLUTION ──────────────────────────────────────────────────────────
+# ─── PERMISSION CACHE ─────────────────────────────────────────────────────────
 
-from pyrogram.raw import functions as raw_functions
-from pyrogram.raw import types as raw_types
+class PermissionCache:
+    """Cache bot admin status in channels to avoid repeated checks."""
+    
+    def __init__(self):
+        self.admin_in: Dict[int, bool] = {}  # {chat_id: is_admin}
+    
+    def is_admin(self, chat_id: int) -> Optional[bool]:
+        """Get cached admin status, or None if not cached."""
+        return self.admin_in.get(chat_id)
+    
+    def set_admin(self, chat_id: int, is_admin: bool):
+        """Cache admin status for a chat."""
+        self.admin_in[chat_id] = is_admin
+        status = "✅ admin" if is_admin else "❌ not admin"
+        log.info(f"Permission cache: {chat_id} → {status}")
+    
+    def clear(self):
+        """Clear all cached permissions (on restart)."""
+        self.admin_in.clear()
+        log.info("Permission cache cleared")
 
-async def resolve_peer_safe(client: Client, chat_id: int) -> bool:
-    """
-    Force Pyrogram to cache a channel peer so copy_message never gets
-    PeerIdInvalid — even after a fresh restart where the session file
-    has no stored peers.
-
-    Strategy (in order):
-      1. client.get_messages() — fetches 1 message, forces peer resolution
-         for channels the bot is already a member/admin of.
-      2. Direct raw API call InputChannel — last-resort populate of cache.
-
-    Returns True when the peer is now cached, False when genuinely inaccessible.
-    """
-    # ── Method 1: get_messages (works for channels bot is member/admin of) ──
-    try:
-        await client.get_messages(chat_id, 1)
-        log.debug(f"Peer {chat_id} resolved via get_messages.")
-        return True
-    except FloodWait as e:
-        log.warning(f"FloodWait {e.value}s resolving {chat_id} — waiting…")
-        await asyncio.sleep(e.value + 1)
-    except (ChannelInvalid, PeerIdInvalid):
-        pass   # fall through to method 2
-    except Exception:
-        pass   # fall through to method 2
-
-    # ── Method 2: raw ResolveUsername / InputPeerChannel via invoke ─────────
-    # Strip -100 prefix to get the bare channel id
-    try:
-        bare_id = int(str(chat_id).replace("-100", ""))
-        # Build InputPeerChannel with access_hash=0 — Telegram will reject
-        # it but Pyrogram will first try to resolve from its peer cache;
-        # we use GetFullChannel so Telegram tells us the real access hash.
-        from pyrogram.raw.functions.channels import GetFullChannel
-        from pyrogram.raw.types import InputChannel
-        await client.invoke(GetFullChannel(channel=InputChannel(
-            channel_id=bare_id,
-            access_hash=0
-        )))
-        log.debug(f"Peer {chat_id} resolved via raw GetFullChannel.")
-        return True
-    except PeerIdInvalid:
-        # access_hash=0 rejected — try fetching dialogs to populate cache
-        pass
-    except Exception:
-        pass
-
-    # ── Method 3: walk dialogs until we find the channel ────────────────────
-    try:
-        async for dialog in client.get_dialogs():
-            if dialog.chat and dialog.chat.id == chat_id:
-                log.debug(f"Peer {chat_id} resolved via get_dialogs walk.")
-                return True
-        log.error(f"Peer {chat_id} not found in dialogs — bot may not be a member.")
-        return False
-    except FloodWait as e:
-        log.warning(f"FloodWait {e.value}s during dialog walk for {chat_id}")
-        await asyncio.sleep(e.value + 1)
-        return False
-    except Exception as e:
-        log.error(f"All resolution methods failed for peer {chat_id}: {e}")
-        return False
-
-
-async def prewarm_peers(client: Client):
-    """
-    Called once right after app.start().
-    Resolves every channel stored in MongoDB so Pyrogram caches them —
-    prevents PeerIdInvalid on the first forwarded message after a restart.
-    """
-    log.info("🔥 Pre-warming peer cache…")
-    peers = await db_manager.get_all_unique_peers()
-    if not peers:
-        log.info("   No peers to warm up.")
-        return
-
-    ok_count = 0
-    for cid in peers:
-        ok = await resolve_peer_safe(client, cid)
-        log.info(f"   Peer {cid}: {'✅' if ok else '❌'}")
-        if ok:
-            ok_count += 1
-
-    log.info(f"🔥 Pre-warm complete — {ok_count}/{len(peers)} peers resolved.")
+perm_cache = PermissionCache()
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -260,24 +197,44 @@ def parse_channel_id(text: str) -> Optional[int]:
         pass
     return None
 
+async def verify_admin_in_chat(client: Client, chat_id: int) -> bool:
+    """
+    Verify bot is actually an admin in the given chat.
+    Returns True if admin, False otherwise.
+    Caches the result.
+    """
+    # Check cache first
+    cached = perm_cache.is_admin(chat_id)
+    if cached is not None:
+        return cached
+    
+    try:
+        me = await client.get_me()
+        member = await client.get_chat_member(chat_id, me.id)
+        is_admin = member.is_admin or member.is_owner
+        perm_cache.set_admin(chat_id, is_admin)
+        return is_admin
+    except UserNotParticipant:
+        log.warning(f"Bot is not a member of {chat_id}")
+        perm_cache.set_admin(chat_id, False)
+        return False
+    except (ChatAdminRequired, ChannelInvalid, PeerIdInvalid) as e:
+        log.error(f"Cannot verify admin status in {chat_id}: {e}")
+        perm_cache.set_admin(chat_id, False)
+        return False
+    except Exception as e:
+        log.error(f"Unexpected error verifying admin in {chat_id}: {e}")
+        return False
 
 async def safe_copy(client: Client, from_chat: int, msg_id: int, to_chat: int) -> bool:
-    """
-    Copy a single message without the forward tag.
-    Resolves both peers first so PeerIdInvalid never surfaces after a restart.
-    """
-    # ── Resolve source peer ──────────────────────────────────────────────────
-    if not await resolve_peer_safe(client, from_chat):
-        log.error(f"Cannot resolve source peer {from_chat} — skipping copy.")
+    """Copy a single message without forward tag, with retry on flood wait."""
+    
+    # Verify admin status before attempting copy
+    if not await verify_admin_in_chat(client, to_chat):
+        log.error(f"Bot is not an admin in target chat {to_chat}")
         return False
-
-    # ── Resolve target peer ──────────────────────────────────────────────────
-    if not await resolve_peer_safe(client, to_chat):
-        log.error(f"Cannot resolve target peer {to_chat} — skipping copy.")
-        return False
-
-    # ── Attempt copy (up to 3 times) ─────────────────────────────────────────
-    for attempt in range(1, 4):
+    
+    for attempt in range(3):
         try:
             await client.copy_message(
                 chat_id=to_chat,
@@ -289,12 +246,12 @@ async def safe_copy(client: Client, from_chat: int, msg_id: int, to_chat: int) -
             log.warning(f"FloodWait {e.value}s — sleeping…")
             await asyncio.sleep(e.value + 1)
         except (ChatAdminRequired, ChannelInvalid, PeerIdInvalid) as e:
-            log.error(f"Permission/channel error on attempt {attempt}: {e}")
+            log.error(f"Permission/channel error: {e}")
+            perm_cache.set_admin(to_chat, False)
             return False
         except Exception as e:
-            log.error(f"Attempt {attempt} failed: {e}")
+            log.error(f"Attempt {attempt + 1} failed: {e}")
             await asyncio.sleep(2)
-
     return False
 
 # ─── BOT FACTORY ──────────────────────────────────────────────────────────────
@@ -308,18 +265,17 @@ def build_app() -> Client:
         bot_token=BOT_TOKEN
     )
 
-# ─── COMMAND HANDLERS ─────────────────────────────────────────────────────────
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
 def register_handlers(app: Client):
     """Register all message handlers on the given Client."""
 
-    # ── /start ────────────────────────────────────────────────────────────────
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(client: Client, msg: Message):
         await msg.reply(
-            "👋 **Welome to the Clean Forward Bot**\n\n"
-            "This bot copies videos and documents from source channels to your "
-            "target channel — without any forwarding headers.\n\n"
+            "👋 **Welcome to the Clean Forward Bot**\n\n"
+            "This bot copies videos and documents from source channels to your target channel "
+            "— without any forwarding headers.\n\n"
             "**Commands:**\n"
             "`/addsource -100xxxxxxxxxx` — Add a source channel\n"
             "`/removesource -100xxxxxxxxxx` — Remove a source channel\n"
@@ -332,7 +288,6 @@ def register_handlers(app: Client):
             "⚙️ Make sure the bot is an **admin** in all channels."
         )
 
-    # ── /addsource ────────────────────────────────────────────────────────────
     @app.on_message(filters.command("addsource") & filters.private)
     async def cmd_addsource(client: Client, msg: Message):
         user_id = msg.from_user.id
@@ -342,23 +297,14 @@ def register_handlers(app: Client):
         cid = parse_channel_id(parts[1])
         if cid is None:
             return await msg.reply("❌ Invalid channel ID. Must start with `-100`.")
-
-        # Try to resolve the peer immediately so we know the bot can see it
-        status_msg = await msg.reply("⏳ Verifying channel access…")
-        if not await resolve_peer_safe(client, cid):
-            return await status_msg.edit(
-                "❌ Cannot access that channel.\n"
-                "Make sure the bot is an **admin** there, then try again."
-            )
-
+        
         added = await db_manager.add_source(user_id, cid)
         if not added:
-            return await status_msg.edit("⚠️ Already in sources list.")
-
-        await status_msg.edit(f"✅ Added source: `{cid}`")
+            return await msg.reply("⚠️ Already in sources list.")
+        
+        await msg.reply(f"✅ Added source: `{cid}`")
         log.info(f"User {user_id}: Source added {cid}")
 
-    # ── /removesource ─────────────────────────────────────────────────────────
     @app.on_message(filters.command(["removesource", "remove"]) & filters.private)
     async def cmd_removesource(client: Client, msg: Message):
         user_id = msg.from_user.id
@@ -368,15 +314,14 @@ def register_handlers(app: Client):
         cid = parse_channel_id(parts[1])
         if cid is None:
             return await msg.reply("❌ Invalid channel ID.")
-
+        
         removed = await db_manager.remove_source(user_id, cid)
         if not removed:
             return await msg.reply("⚠️ Not in sources list.")
-
+        
         await msg.reply(f"✅ Removed source: `{cid}`")
         log.info(f"User {user_id}: Source removed {cid}")
 
-    # ── /settarget ────────────────────────────────────────────────────────────
     @app.on_message(filters.command("settarget") & filters.private)
     async def cmd_settarget(client: Client, msg: Message):
         user_id = msg.from_user.id
@@ -386,20 +331,19 @@ def register_handlers(app: Client):
         cid = parse_channel_id(parts[1])
         if cid is None:
             return await msg.reply("❌ Invalid channel ID. Must start with `-100`.")
-
-        # Verify access before saving
-        status_msg = await msg.reply("⏳ Verifying channel access…")
-        if not await resolve_peer_safe(client, cid):
-            return await status_msg.edit(
-                "❌ Cannot access that channel.\n"
-                "Make sure the bot is an **admin** there, then try again."
+        
+        # Verify bot is admin in target before setting
+        is_admin = await verify_admin_in_chat(client, cid)
+        if not is_admin:
+            return await msg.reply(
+                f"❌ Bot is not an admin in `{cid}`.\n\n"
+                "**Fix:** Add the bot as an admin to the target channel, then try again."
             )
-
+        
         await db_manager.set_target(user_id, cid)
-        await status_msg.edit(f"✅ Target set to: `{cid}`")
+        await msg.reply(f"✅ Target set to: `{cid}`")
         log.info(f"User {user_id}: Target set to {cid}")
 
-    # ── /cleartarget ──────────────────────────────────────────────────────────
     @app.on_message(filters.command("cleartarget") & filters.private)
     async def cmd_cleartarget(client: Client, msg: Message):
         user_id = msg.from_user.id
@@ -407,23 +351,21 @@ def register_handlers(app: Client):
         await msg.reply("✅ Target channel cleared.")
         log.info(f"User {user_id}: Target cleared")
 
-    # ── /list  /myforwards ────────────────────────────────────────────────────
     @app.on_message(filters.command(["list", "myforwards"]) & filters.private)
     async def cmd_list(client: Client, msg: Message):
         user_id = msg.from_user.id
         sources = await db_manager.get_sources(user_id)
-        target  = await db_manager.get_target(user_id)
-
+        target = await db_manager.get_target(user_id)
+        
         src_txt = "\n".join(f"  • `{s}`" for s in sources) if sources else "  _None_"
         tgt_txt = f"`{target}`" if target else "_Not set_"
-
+        
         await msg.reply(
             "📋 **Current Settings**\n\n"
             f"**Sources:**\n{src_txt}\n\n"
             f"**Target:** {tgt_txt}"
         )
 
-    # ── /check ────────────────────────────────────────────────────────────────
     @app.on_message(filters.command("check") & filters.private)
     async def cmd_check(client: Client, msg: Message):
         """Copy a specific message by its t.me/c/ link."""
@@ -435,13 +377,11 @@ def register_handlers(app: Client):
         url = parts[1]
         m = re.match(r"https://t\.me/c/(\d+)/(\d+)", url)
         if not m:
-            return await msg.reply(
-                "❌ Unsupported link format. Use `https://t.me/c/xxxx/yyy`"
-            )
+            return await msg.reply("❌ Unsupported link format. Use `https://t.me/c/xxxx/yyy`")
 
         chat_id = int("-100" + m.group(1))
-        msg_id  = int(m.group(2))
-        target  = await db_manager.get_target(user_id)
+        msg_id = int(m.group(2))
+        target = await db_manager.get_target(user_id)
 
         if not target:
             return await msg.reply("❌ No target set. Use `/settarget` first.")
@@ -449,7 +389,7 @@ def register_handlers(app: Client):
         status = await msg.reply("⏳ Copying message…")
         ok = await safe_copy(client, chat_id, msg_id, target)
         await db_manager.record_copy(user_id, chat_id, msg_id, target, ok)
-
+        
         if ok:
             await status.edit("✅ Message copied successfully!")
             log.info(f"User {user_id}: Message {msg_id} copied from {chat_id} to {target}")
@@ -457,101 +397,91 @@ def register_handlers(app: Client):
             await status.edit("❌ Failed to copy. Check bot permissions and logs.")
             log.error(f"User {user_id}: Failed to copy message {msg_id} from {chat_id}")
 
-    # ── /stats ────────────────────────────────────────────────────────────────
     @app.on_message(filters.command("stats") & filters.private)
     async def cmd_stats(client: Client, msg: Message):
+        """Show user statistics."""
         user_id = msg.from_user.id
         stats = await db_manager.stats_collection.find_one({"user_id": user_id})
-
+        
         if not stats:
             return await msg.reply("📊 No statistics yet. Start copying messages!")
-
-        total   = stats.get("total_copies", 0)
+        
+        total = stats.get("total_copies", 0)
         success = stats.get("successful_copies", 0)
-        failed  = stats.get("failed_copies", 0)
-        rate    = (success / total * 100) if total > 0 else 0
-
+        failed = stats.get("failed_copies", 0)
+        
+        success_rate = (success / total * 100) if total > 0 else 0
+        
         await msg.reply(
             "📊 **Your Statistics**\n\n"
             f"Total Copies: `{total}`\n"
             f"Successful: `{success}`\n"
             f"Failed: `{failed}`\n"
-            f"Success Rate: `{rate:.1f}%`"
+            f"Success Rate: `{success_rate:.1f}%`"
         )
 
-    # ── Auto-forward: new channel posts ──────────────────────────────────────
+    # ─── AUTO-FORWARD HANDLER (PER USER) ─────────────────────────────────────
 
     @app.on_message(filters.channel)
     async def handle_channel_post(client: Client, msg: Message):
         """Triggered for every new channel post the bot can see."""
         chat_id = msg.chat.id
-
-        # Only process video or document messages
-        if not (msg.video or msg.document):
-            return
-
+        
         # Find all users who have this channel as a source
         all_users = await db_manager.users_collection.find(
             {"sources": {"$in": [chat_id]}}
         ).to_list(None)
-
+        
         if not all_users:
             return
+        
+        if not (msg.video or msg.document):
+            return
 
+        # Process for each user who follows this source
         for user_config in all_users:
             user_id = user_config["user_id"]
-            target  = user_config.get("target")
-
+            target = user_config.get("target")
+            
             if not target:
-                log.warning(
-                    f"User {user_id}: message from source {chat_id} "
-                    "received but no target is set."
-                )
+                log.warning(f"User {user_id}: Received message from source {chat_id} but no target is set.")
                 continue
 
             log.info(f"User {user_id}: Copying msg {msg.id} from {chat_id} → {target}")
             ok = await safe_copy(client, chat_id, msg.id, target)
             await db_manager.record_copy(user_id, chat_id, msg.id, target, ok)
-
+            
             if not ok:
-                log.error(
-                    f"User {user_id}: Failed to copy msg {msg.id} from {chat_id}"
-                )
+                log.error(f"User {user_id}: Failed to copy msg {msg.id} from {chat_id}")
 
 # ─── AUTO-RESTART WATCHDOG ────────────────────────────────────────────────────
 
 _stop_requested = False
 
 def _handle_sigterm(signum, frame):
+    """On SIGTERM / Ctrl-C, stop the restart loop gracefully."""
     global _stop_requested
     log.info("Stop signal received — shutting down permanently.")
     _stop_requested = True
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
-signal.signal(signal.SIGINT,  _handle_sigterm)
-
+signal.signal(signal.SIGINT, _handle_sigterm)
 
 async def run_once() -> None:
-    """Start the bot, pre-warm peers, then run until crash or stop."""
+    """Start the bot and run until it crashes or stops."""
+    # Clear permission cache on each restart
+    perm_cache.clear()
+    
     await db_manager.connect()
     app = build_app()
     register_handlers(app)
     await app.start()
-
-    # ── Key fix: warm up every stored peer right after start ─────────────────
-    await prewarm_peers(app)
-
     log.info("✅ Bot is running.")
     try:
-        await asyncio.Event().wait()   # block forever
+        await asyncio.Event().wait()  # block until an exception kills the task
     finally:
-        try:
-            await app.stop()
-        except Exception:
-            pass
         await db_manager.disconnect()
-
 
 def run_with_autorestart() -> None:
     """Keep restarting the bot forever (unless SIGTERM/SIGINT received)."""
@@ -587,10 +517,8 @@ def run_with_autorestart() -> None:
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
-        log.error(
-            "❌ Missing required environment variables: BOT_TOKEN, API_ID, API_HASH"
-        )
+        log.error("❌ Missing required environment variables: BOT_TOKEN, API_ID, API_HASH")
         sys.exit(1)
-
+    
     log.info("🤖 Clean Forward Bot starting with auto-restart watchdog (MongoDB backend)…")
     run_with_autorestart()
